@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: pilot-api
+    runtime: node
+    buildCommand: npm ci && npm run build:server
+    startCommand: npm run start:server
+    healthCheckPath: /health
+    envVars:
+      - key: PERSIMMON_API_KEY
+        sync: false
+      - key: WEB_ORIGIN
+        sync: false
