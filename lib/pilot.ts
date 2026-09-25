@@ -1,4 +1,5 @@
 import { createConversation, nextPersonaTurn } from "./persimmon.js";
+import { planAction, ProductHarness } from "./harness.js";
 import type { CreateTestInput, Persona, PersonaResult, PilotReport, TranscriptTurn } from "./types.js";
 
 const reports = new Map<string, PilotReport>();
@@ -24,29 +25,6 @@ function record(report: PilotReport, event: string) {
   report.events.push(event);
 }
 
-async function artifactContext(source: string) {
-  if (!source.startsWith("http")) return source;
-  const response = await fetch(source, { signal: AbortSignal.timeout(8_000) });
-  if (!response.ok) throw new Error(`Could not read ${source} (${response.status})`);
-  const html = await response.text();
-  return html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 12_000);
-}
-
-function mockResult(persona: Persona, mode: CreateTestInput["mode"]): PersonaResult {
-  const complaint = mode === "agent" ? "I still do not know what the agent will do with my request." : "I cannot tell what happens after I try it.";
-  return {
-    persona,
-    turns: [
-      { speaker: "persona", content: "What is the first useful thing I can do here?", sentiment: 0.25 },
-      { speaker: "product", content: "The product explains its core workflow, but leaves the next step implicit.", sentiment: 0.02 },
-      { speaker: "persona", content: complaint, sentiment: -0.5 },
-    ],
-    verdict: "maybe",
-    dropOff: "First meaningful action is not obvious",
-    finding: "The value proposition lands, but the first action needs to be explicit.",
-  };
-}
-
 async function callAgent(endpoint: string, message: string, persona: Persona) {
   const response = await fetch(endpoint, {
     method: "POST",
@@ -59,7 +37,7 @@ async function callAgent(endpoint: string, message: string, persona: Persona) {
 }
 
 async function runPersona(input: CreateTestInput, persona: Persona, context: string): Promise<PersonaResult> {
-  if (!process.env.PERSIMMON_API_KEY) return mockResult(persona, input.mode);
+  if (!process.env.PERSIMMON_API_KEY) throw new Error("PERSIMMON_API_KEY is required for a live user session.");
   const productName = "Product";
   const conversation = await createConversation(
     `You are evaluating this ${input.mode === "agent" ? "agent" : "product artifact"}:\n${context}\nStay in character. Your replies should reveal genuine uncertainty, friction, interest, or skepticism.`,
@@ -68,20 +46,24 @@ async function runPersona(input: CreateTestInput, persona: Persona, context: str
       { name: productName, description: "The product under evaluation. Its messages are supplied by the evaluation harness.", generate_content: false },
     ],
   );
-  const history: { name: string; content: string }[] = [{ name: productName, content: input.mode === "artifact" ? "You have just encountered this page. What do you make of it?" : "You can now message the agent." }];
+  const harness = input.mode === "artifact" ? new ProductHarness() : undefined;
+  const initial = harness ? await harness.open(input.source) : undefined;
+  const history: { name: string; content: string }[] = [{ name: productName, content: initial ? `You are viewing ${initial.title} at ${initial.url}. Visible product state: ${initial.text}` : "You can now message the agent." }];
   const turns: TranscriptTurn[] = [];
 
-  for (let step = 0; step < 2; step++) {
+  try {
+  for (let step = 0; step < 3; step++) {
     const simulated = await nextPersonaTurn(conversation.id, persona.name, history);
     const message = simulated.content ?? "";
     history.push({ name: persona.name, content: message });
     turns.push({ speaker: "persona", content: message, sentiment: step === 0 ? 0.1 : -0.1 });
     const productReply = input.mode === "agent"
       ? await callAgent(input.source, message, persona)
-      : "You are reading the product information above. Continue evaluating whether it is concrete enough to try.";
+      : await browserResult(harness!, message);
     history.push({ name: productName, content: productReply });
     turns.push({ speaker: "product", content: productReply, sentiment: 0 });
   }
+  } finally { await harness?.close(); }
   const last = turns.at(-2)?.content ?? "";
   const negative = /confus|don't|do not|unclear|can't|cannot|why/i.test(last);
   return {
@@ -91,6 +73,14 @@ async function runPersona(input: CreateTestInput, persona: Persona, context: str
     dropOff: negative ? "Confidence falls after the second exchange" : undefined,
     finding: negative ? "This persona could not connect the product response to their goal." : "Interested, but needs one more concrete proof point.",
   };
+}
+
+async function browserResult(harness: ProductHarness, personaTurn: string) {
+  const state = await harness.act({ type: "scroll", rationale: "Read current page state" }).then((result) => result.state);
+  const action = await planAction(personaTurn, state);
+  const result = await harness.act(action);
+  const outcome = result.ok ? `Browser action completed: ${action.rationale}. Current URL: ${result.state.url}. Visible result: ${result.state.text}` : `Browser action failed: ${result.error}. Current page: ${result.state.text}`;
+  return outcome.slice(0, 8_000);
 }
 
 function summary(personas: PersonaResult[]) {
@@ -111,7 +101,7 @@ export async function runTest(id: string, input: CreateTestInput, onEvent?: (eve
   report.status = "running";
   const emit = (event: string) => { record(report, event); onEvent?.(event); };
   try {
-    const context = input.mode === "artifact" ? await artifactContext(input.source) : input.source;
+    const context = input.mode === "artifact" ? `A real browser harness will operate ${input.source}. Every observed browser result will be supplied by the controlled Product participant.` : input.source;
     const chosen: Persona[] = Array.from({ length: input.personaCount }, (_, index) => ({ ...profiles[index % profiles.length]!, id: `p${index + 1}` }));
     emit(`Context ready. Sending ${chosen.length} people in.`);
     for (const persona of chosen) {
