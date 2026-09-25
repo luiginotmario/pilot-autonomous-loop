@@ -1,5 +1,4 @@
 import express from "express";
-import { resolve } from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createTest, getReport, runTest } from "../lib/pilot.js";
 import { makeMcpServer } from "./mcp.js";
@@ -47,8 +46,5 @@ app.all("/mcp", async (request, response) => {
   response.on("close", () => { void transport.close(); void server.close(); });
 });
 
-const client = resolve(process.cwd(), "dist/client");
-app.use(express.static(client));
-app.get("/{*path}", (_request, response) => response.sendFile(resolve(client, "index.html")));
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => console.log(`PILOT API listening on ${port}`));
